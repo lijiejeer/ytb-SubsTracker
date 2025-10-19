@@ -1,6 +1,6 @@
 # ytb-SubsTracker
 
-一、功能总览与关键点
+# 一、功能总览与关键点
 系统包含三大模块：
 登录与订阅列表管理页 /admin（带到期提醒、农历、分类筛选、测试通知等）
 系统配置页 /admin/config（通知渠道、时区、通知时段、第三方 API Token）
@@ -14,11 +14,11 @@ YouTube 订阅页 /admin/youtube（频道订阅、轮询 RSS、KV 去重推送�
 第三方推送：/api/notify/{token}
 YouTube：/api/yt/channels、/api/yt/cron、/api/yt/test、/api/yt/logs（新增）
 YouTube 频道新增时，后端会解析频道名 feed.title 并连同 { ok, id, title } 返回前端，前端可立即提示，无需等待二次刷新
-二、准备工作
+# 二、准备工作
 Cloudflare 账号（Workers 可用）
 一个 Workers 子域或自有域（用 *.workers.dev 或自定义 Route 都可）
 Resend、Telegram、企业微信机器人、NotifyX、Bark 等至少一种通知渠道（可后配）
-三、部署方式 A：Cloudflare Dashboard 直接部署
+# 三、部署方式 A：Cloudflare Dashboard 直接部署
 新建 Worker
 进入 Cloudflare Dashboard → Workers & Pages → Create → “Create Worker”
 将你的（index.js）全部内容粘贴覆盖保存（点 Save and deploy）
@@ -36,7 +36,7 @@ Note：定时任务会调用 scheduled() 钩子，执行订阅到期检查（以
 打开 https://你的-workers-子域/ 或 /debug
 / 会出现登录页
 /debug 会显示 KV 绑定与配置读取等健康信息
-四、部署方式 B：Wrangler CLI（本地/CI）
+# 四、部署方式 B：Wrangler CLI（本地/CI）
 安装/登录
 npm i -g wrangler
 wrangler login
@@ -57,7 +57,7 @@ id = "<你的KV命名空间ID>"
 crons = ["*/10 * * * *"]
 发布
 wrangler publish
-五、首次初始化与后台配置
+# 五、首次初始化与后台配置
 登录
 打开 /（根路径）；初始账号密码在 KV 不存在时为 admin / password
 登录后会写入 JWT cookie；如 401，检查浏览器同站策略与域名路径
@@ -74,11 +74,11 @@ YouTube 订阅 /admin/youtube
 新增时后端立即返回 { ok, id, title }，并只记录最新一条为 last（不会推历史，避免刷屏）
 点击“手动检测”或等待 Cron 定时检测；新视频将推送到已配置的通知渠道（通过 /api/yt/cron）
 “最近日志”查看订阅更新记录（/api/yt/logs）
-六、定时任务与执行频率
+# 六、定时任务与执行频率
 Cloudflare Cron 触发 scheduled()。建议 5–15 分钟一次，避免过密抓取 RSS
 在代码中，YouTube 巡检函数 ytCheckAll(env) 应在 scheduled 中被调用（若你按建议添加了），否则只会跑到期提醒
 注：KV 为最终一致性存储；定时批量写入后，读取可能有短暂延时是正常现象
-七、第三方推送 API 用法（可选）
+# 七、第三方推送 API 用法（可选）
 配置好 THIRD_PARTY_API_TOKEN 后，POST /api/notify/{token}
 示例：
 text
@@ -92,7 +92,7 @@ curl -X POST "https://你的域名或workers.dev/api/notify/<token>" \
     "tags": ["外部系统", "重要"]
   }'
 服务端会复用你在“系统配置”里启用的通知通道进行推送
-八、常见排错
+# 八、常见排错
 401 未授权：先访问 / 登录；确认浏览器未阻止 Cookie；同域路径访问 /admin、/api/* 都需要登录
 KV 未绑定或名称错误：Worker Settings → Bindings 中必须将命名空间绑定为 SUBSCRIPTIONS_KV（名字要与代码一致）
 Cron 未执行：检查 Triggers → Cron 是否已保存；查看 Worker Logs 是否有“定时任务触发”输出
@@ -104,7 +104,7 @@ YouTube 更新收不到：
 查看 /api/yt/logs 是否记录“pushed …”；
 多频道较多时 Cloudflare 边缘请求过快被限，代码中已 sleep 节流；适当放缓 Cron 频率
 编码乱码（仅若你本地看到 “��” 之类乱码）：确保 index.js 保存为 UTF-8（无 BOM）
-九、注意事项与配额
+# 九、注意事项与配额
 Workers 免费版有日请求、CPU 时间等限制；KV 有读写计费与最终一致性特性
 邮件通过 Resend，域名需在 Resend 验证（邮件发不出多半是发件域未验证）
 遵守当地法律与 YouTube/通知渠道使用条款；RSS 轮询不使用 API Key
