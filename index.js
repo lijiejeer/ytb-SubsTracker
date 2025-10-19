@@ -5,6 +5,73 @@
 const MS_PER_HOUR = 1000 * 60 * 60;
 const MS_PER_DAY = MS_PER_HOUR * 24;
 
+// ===== YouTube 订阅：KV 键名与工具函数 =====
+const YT_CHANNELS_KEY = 'yt_channels';
+const YT_LOGS_KEY = 'yt_logs';
+const ytLastKey = (id) => `yt:last:${id}`;
+
+async function ytGetChannels(env) {
+  const raw = await env.SUBSCRIPTIONS_KV.get(YT_CHANNELS_KEY);
+  return raw ? JSON.parse(raw) : []; // [{ id: 'UCxxxx', title?: 'Channel Name' }]
+}
+async function ytSetChannels(env, list) {
+  const uniq = Array.from(new Set(list.map(x => typeof x === 'string' ? x : x.id)))
+    .map(id => ({ id }));
+  await env.SUBSCRIPTIONS_KV.put(YT_CHANNELS_KEY, JSON.stringify(uniq));
+}
+async function ytLog(env, line) {
+  const ts = new Date().toISOString().replace('T',' ').replace('Z','');
+  const entry = `[${ts}] ${line}`;
+  const raw = await env.SUBSCRIPTIONS_KV.get(YT_LOGS_KEY);
+  const arr = raw ? JSON.parse(raw) : [];
+  arr.push(entry);
+  if (arr.length > 200) arr.splice(0, arr.length - 200);
+  await env.SUBSCRIPTIONS_KV.put(YT_LOGS_KEY, JSON.stringify(arr));
+}
+async function ytGetLogs(env) {
+  const raw = await env.SUBSCRIPTIONS_KV.get(YT_LOGS_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+
+// 提取 UCID 或从 URL/handle 解析 UCID（服务端版）
+function ytPickChannelId(input) {
+  if (!input) return '';
+  if (/^UC[0-9A-Za-z_\-]+$/.test(input)) return input;
+  const m = input.match(/youtube\.com\/channel\/(UC[0-9A-Za-z_\-]+)/);
+  if (m) return m[1];
+  return '';
+}
+async function ytResolveChannelId(url) {
+  const r = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' } });
+  const html = await r.text();
+  const m = html.match(/"channelId":"(UC[0-9A-Za-z_\-]+)"/);
+  return m ? m[1] : '';
+}
+
+// 解析 YouTube RSS（取最近若干条）
+function ytParseRSS(xml) {
+  const title = ((m)=>m?m[1]:'')(xml.match(/<title>([^<]+)<\/title>/));
+  const entries = [];
+  const re = /<entry>([\s\S]*?)<\/entry>/g;
+  let m;
+  while ((m = re.exec(xml)) && entries.length < 10) {
+    const block = m[1];
+    const id = ((m)=>m?m[1]:'')(block.match(/<yt:videoId>([^<]+)<\/yt:videoId>/));
+    const etitle = ((m)=>m?m[1]:'')(block.match(/<title>([^<]+)<\/title>/));
+    const link = ((m)=>m?m[1]:'')(block.match(/<link[^>]+href="([^"]+)"/));
+    const published = ((m)=>m?m[1]:'')(block.match(/<published>([^<]+)<\/published>/));
+    if (id && etitle && link) {
+      entries.push({ id, title: decodeXml(etitle), link, published });
+    }
+  }
+  return { title, entries };
+}
+function decodeXml(s) {
+  return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+          .replace(/&quot;/g,'"').replace(/&#39;/g,"'");
+}
+// ===== YouTube 订阅：KV 键名与工具函数完 =====
+
 function getCurrentTimeInTimezone(timezone = 'UTC') {
   try {
     // Workers 环境下 Date 始终存储 UTC 时间，这里直接返回当前时间对象
@@ -3110,6 +3177,135 @@ const lunarBiz = {
 </html>
 `;
 
+const ytAdminPage = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube 订阅 - 订阅管理系统</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+  <style>
+    .btn-primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); transition:.3s; }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,.1); }
+    .btn-danger { background: linear-gradient(135deg, #f87171 0%, #dc2626 100%); transition:.3s; color:#fff; }
+    .btn-info { background: linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%); transition:.3s; color:#fff; }
+    .toast { position:fixed; top:20px; right:20px; padding:12px 20px; border-radius:8px; color:#fff; z-index:1000; transform:translateX(400px); transition:.3s; }
+    .toast.show{ transform:translateX(0); } .toast.success{ background:#10b981; } .toast.error{ background:#ef4444; }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+  <div id="toast"></div>
+  <nav class="bg-white shadow-md">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="flex justify-between h-16">
+        <div class="flex items-center">
+          <i class="fas fa-calendar-check text-indigo-600 text-2xl mr-2"></i>
+          <span class="font-bold text-xl text-gray-800">订阅管理系统</span>
+        </div>
+        <div class="flex items-center space-x-4">
+          <a href="/admin" class="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium"><i class="fas fa-list mr-1"></i>订阅列表</a>
+          <a href="/admin/youtube" class="text-indigo-600 border-b-2 border-indigo-600 px-3 py-2 rounded-md text-sm font-medium"><i class="fab fa-youtube mr-1"></i>YouTube订阅</a>
+          <a href="/admin/config" class="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium"><i class="fas fa-cog mr-1"></i>系统配置</a>
+          <a href="/api/logout" class="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium"><i class="fas fa-sign-out-alt mr-1"></i>退出登录</a>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div class="bg-white rounded-lg shadow-md p-6">
+      <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+        <div>
+          <h2 class="text-2xl font-bold text-gray-800">YouTube 订阅</h2>
+          <p class="text-sm text-gray-500 mt-1">粘贴频道 URL（支持 /channel/UC… 或 @handle）或 UCID（UC…）进行订阅</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <input id="input" class="px-3 py-2 border rounded-md w-80" placeholder="UCID 或频道链接">
+          <button class="btn-primary px-4 py-2 rounded-md text-white text-sm" onclick="add()">添加频道</button>
+          <button class="btn-info px-4 py-2 rounded-md text-sm" onclick="cron()">手动检测</button>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-gray-200">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">UCID</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">频道名</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">上次记录</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody" class="bg-white divide-y divide-gray-200"></tbody>
+        </table>
+      </div>
+
+      <div class="mt-8">
+        <div class="flex items-center justify-between">
+          <h3 class="text-lg font-semibold text-gray-800">最近日志</h3>
+          <button class="px-3 py-1 border rounded-md text-sm" onclick="logs()">刷新日志</button>
+        </div>
+        <pre id="logs" class="mt-2 p-3 bg-gray-50 rounded-md text-sm overflow-auto" style="max-height:260px"></pre>
+      </div>
+    </div>
+  </div>
+
+<script>
+function toast(msg, ok=true){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+(ok?'success':'error');setTimeout(()=>t.classList.add('show'),50);setTimeout(()=>{t.classList.remove('show')},2200)}
+async function api(path,opt){const r=await fetch(path,Object.assign({headers:{'content-type':'application/json'}},opt));if(!r.ok) throw new Error('HTTP '+r.status);return r.json()}
+async function load(){
+  const d = await api('/api/yt/channels');
+  const tb = document.getElementById('tbody'); tb.innerHTML='';
+  d.channels.forEach(ch=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td class="px-4 py-2 mono">'+ch.id+'</td>'+
+      '<td class="px-4 py-2">'+(ch.title||'-')+'</td>'+
+      '<td class="px-4 py-2 mono">'+(d.state[ch.id]||'-')+'</td>'+
+      '<td class="px-4 py-2">'+
+      '<button class="btn-info px-2 py-1 rounded-md text-white text-xs mr-2" onclick="test(\\''+ch.id+'\\')">检测</button>'+
+      '<button class="btn-danger px-2 py-1 rounded-md text-xs" onclick="delch(\\''+ch.id+'\\')">删除</button>'+
+      '</td>';
+    tb.appendChild(tr);
+  });
+}
+async function add(){
+  const v = document.getElementById('input').value.trim();
+  if(!v){ toast('请输入 UCID 或频道链接',false); return; }
+  await api('/api/yt/channels',{method:'POST', body: JSON.stringify({ input:v })});
+  document.getElementById('input').value='';
+  toast('已添加');
+  load();
+}
+async function delch(id){
+  if(!confirm('确定删除 '+id+' ?')) return;
+  await fetch('/api/yt/channels/'+encodeURIComponent(id), {method:'DELETE'});
+  toast('已删除');
+  load();
+}
+async function cron(){
+  const d = await api('/api/yt/cron');
+  toast('已执行：处理 '+d.processed+' 个频道');
+  load();
+}
+async function test(id){
+  const d = await api('/api/yt/test?channel_id='+encodeURIComponent(id));
+  toast('检测完成：'+(d.pushedCount||0)+' 条');
+  load();
+}
+async function logs(){
+  const d = await api('/api/yt/logs');
+  document.getElementById('logs').textContent = d.slice().reverse().join('\\n');
+}
+load(); logs();
+</script>
+</body>
+</html>
+`;
+
+
 const configPage = `
 <!DOCTYPE html>
 <html>
@@ -4060,6 +4256,14 @@ const admin = {
         });
       }
 
+		// 在 if (pathname === '/admin/config') {...} 之后增加：
+	if (pathname === '/admin/youtube') {
+	  return new Response(ytAdminPage, {
+	    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+	  });
+	}
+
+
       return new Response(adminPage, {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
@@ -4335,6 +4539,69 @@ const api = {
       }
     }
 
+		// ===== YouTube 订阅 API =====
+	// 列表
+	if (path === '/yt/channels' && method === 'GET') {
+	  const list = await ytGetChannels(env);
+	  const state = {};
+	  for (const ch of list) {
+	    state[ch.id] = await env.SUBSCRIPTIONS_KV.get(ytLastKey(ch.id));
+	  }
+	  return new Response(JSON.stringify({ channels: list, state }), { headers: { 'Content-Type': 'application/json' } });
+	}
+	// 新增
+	if (path === '/yt/channels' && method === 'POST') {
+	  const body = await request.json().catch(()=>({}));
+	  const input = (body.input||'').trim();
+	  if (!input) return new Response(JSON.stringify({ ok:false, message:'missing input' }), { status:400, headers:{'Content-Type':'application/json'} });
+	  let id = ytPickChannelId(input);
+	  if (!id && input.includes('youtube.com/')) id = await ytResolveChannelId(input);
+	  if (!id) return new Response(JSON.stringify({ ok:false, message:'cannot extract UCID' }), { status:400, headers:{'Content-Type':'application/json'} });
+	  const list = await ytGetChannels(env);
+	  if (!list.find(x=>x.id===id)) {
+	    list.push({ id });
+	    await ytSetChannels(env, list);
+	    // 初始化：只记录最新一条，不推历史
+	    const rss = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${id}`, { headers: { 'user-agent':'Mozilla/5.0' }});
+	    if (rss.ok) {
+	      const xml = await rss.text();
+	      const feed = ytParseRSS(xml);
+	      if (feed.entries[0]) await env.SUBSCRIPTIONS_KV.put(ytLastKey(id), feed.entries[0].id);
+	      // 顺便记录频道名
+	      const idx = list.findIndex(x=>x.id===id);
+	      if (idx>=0) { list[idx].title = feed.title||''; await env.SUBSCRIPTIONS_KV.put(YT_CHANNELS_KEY, JSON.stringify(list)); }
+	    }
+	    await ytLog(env, `add ${id}`);
+	  }
+	  return new Response(JSON.stringify({ ok:true, id }), { headers:{'Content-Type':'application/json'} });
+	}
+	// 删除
+	if (path.startsWith('/yt/channels/') && method === 'DELETE') {
+	  const id = decodeURIComponent(path.split('/').pop());
+	  const list = await ytGetChannels(env);
+	  const next = list.filter(x=>x.id!==id);
+	  await env.SUBSCRIPTIONS_KV.put(YT_CHANNELS_KEY, JSON.stringify(next));
+	  await env.SUBSCRIPTIONS_KV.delete(ytLastKey(id));
+	  await ytLog(env, `remove ${id}`);
+	  return new Response(JSON.stringify({ ok:true }), { headers:{'Content-Type':'application/json'} });
+	}
+	// 手动检测所有
+	if (path === '/yt/cron' && method === 'GET') {
+	  const res = await ytCheckAll(env);
+	  return new Response(JSON.stringify(res), { headers: { 'Content-Type':'application/json' }});
+	}
+	// 单频道测试
+	if (path === '/yt/test' && method === 'GET') {
+	  const id = url.searchParams.get('channel_id');
+	  const one = await ytProcessChannel(env, id);
+	  return new Response(JSON.stringify(one), { headers:{ 'Content-Type':'application/json'} });
+	}
+	// 日志
+	if (path === '/yt/logs' && method === 'GET') {
+	  return new Response(JSON.stringify(await ytGetLogs(env)), { headers:{'Content-Type':'application/json'} });
+	}
+
+
     if (path.startsWith('/subscriptions/')) {
       const parts = path.split('/');
       const id = parts[2];
@@ -4442,6 +4709,83 @@ const api = {
             metadata: { tags: bodyTags }
           });
 
+				// ===== YouTube 抓取与推送 =====
+	async function ytProcessChannel(env, channelId) {
+	  if (!channelId) return { channelId, status: 'no_id' };
+	  const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+	  let resp;
+	  try {
+	    resp = await fetch(rssUrl, { headers: { 'user-agent': 'Mozilla/5.0 (Workers; YT RSS)' }});
+	  } catch (e) {
+	    await ytLog(env, `fetch error ${channelId} ${e}`);
+	    return { channelId, status:'fetch_error' };
+	  }
+	  if (!resp.ok) {
+	    await ytLog(env, `fetch fail ${channelId} http=${resp.status}`);
+	    return { channelId, status:'fetch_fail', http: resp.status };
+	  }
+	  const xml = await resp.text();
+	  const feed = ytParseRSS(xml);
+	  if (!feed.entries.length) return { channelId, status:'no_entries' };
+	
+	  const last = await env.SUBSCRIPTIONS_KV.get(ytLastKey(channelId));
+	  let toPush = [];
+	  if (!last) {
+	    await env.SUBSCRIPTIONS_KV.put(ytLastKey(channelId), feed.entries[0].id);
+	    await ytLog(env, `init last ${channelId} -> ${feed.entries[0].id}`);
+	    // 更新频道名
+	    const chs = await ytGetChannels(env);
+	    const idx = chs.findIndex(x=>x.id===channelId);
+	    if (idx>=0) { chs[idx].title = feed.title||''; await env.SUBSCRIPTIONS_KV.put(YT_CHANNELS_KEY, JSON.stringify(chs)); }
+	    return { channelId, status:'initialized', saved: feed.entries[0].id, channelTitle: feed.title };
+	  } else {
+	    const idx = feed.entries.findIndex(e => e.id === last);
+	    if (idx === -1) {
+	      toPush = [feed.entries[0]]; // 仅最新一条，避免刷屏
+	    } else if (idx > 0) {
+	      toPush = feed.entries.slice(0, idx).reverse(); // 旧->新
+	    }
+	  }
+	
+	  const config = await getConfig(env);
+	  const timezone = config?.TIMEZONE || 'UTC';
+	  let pushed = 0;
+	  for (const e of toPush) {
+	    const pub = e.published ? formatTimeInTimezone(new Date(e.published), timezone, 'datetime') : '';
+	    const title = `YouTube 更新：${feed.title || channelId}`;
+	    const content = `频道：${feed.title || channelId}
+	标题：${e.title}
+	链接：${e.link}
+	发布时间：${pub}
+	当前时区：${formatTimezoneDisplay(timezone)}`;
+	
+	    await sendNotificationToAllChannels(title, content, config, '[YouTube]');
+	    pushed++;
+	    await env.SUBSCRIPTIONS_KV.put(ytLastKey(channelId), e.id);
+	    await ytLog(env, `pushed ${channelId} ${e.id} ${e.title}`);
+	    await new Promise(r=>setTimeout(r, 400));
+	  }
+	
+	  // 无新内容但最新条与 last 不同（feed 裁剪）则对齐
+	  if (!toPush.length && feed.entries[0].id !== last) {
+	    await env.SUBSCRIPTIONS_KV.put(ytLastKey(channelId), feed.entries[0].id);
+	  }
+	
+	  return { channelId, channelTitle: feed.title, pushedCount: pushed, last: await env.SUBSCRIPTIONS_KV.get(ytLastKey(channelId)) };
+	}
+	
+	async function ytCheckAll(env) {
+	  const list = await ytGetChannels(env);
+	  const results = [];
+	  for (const ch of list) {
+	    results.push(await ytProcessChannel(env, ch.id));
+	    await new Promise(r=>setTimeout(r, 800));
+	  }
+	  await ytLog(env, `cron done: ${results.length}`);
+	  return { processed: results.length, results };
+	}
+
+			
           return new Response(
             JSON.stringify({
               message: '发送成功',
@@ -5769,5 +6113,6 @@ export default {
     const currentTime = getCurrentTimeInTimezone(timezone);
     console.log('[Workers] 定时任务触发 UTC:', new Date().toISOString(), timezone + ':', currentTime.toLocaleString('zh-CN', {timeZone: timezone}));
     await checkExpiringSubscriptions(env);
+	await ytCheckAll(env);                   // 新增 YouTube 订阅检测
   }
 };
