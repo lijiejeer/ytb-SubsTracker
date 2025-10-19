@@ -3405,6 +3405,7 @@ async function load(){
       '<td class="px-4 py-2 mono">'+(d.state[ch.id]||'-')+'</td>'+
       '<td class="px-4 py-2">'+
       '<button class="btn-info px-2 py-1 rounded-md text-white text-xs mr-2" onclick="test(\\''+ch.id+'\\')">检测</button>'+
+      '<button class="btn-primary px-2 py-1 rounded-md text-white text-xs mr-2" onclick="testLatest(\\''+ch.id+'\\')">测试</button>'+
       '<button class="btn-danger px-2 py-1 rounded-md text-xs" onclick="delch(\\''+ch.id+'\\')">删除</button>'+
       '</td>';
     tb.appendChild(tr);
@@ -3413,26 +3414,15 @@ async function load(){
 async function add(){
   const v = document.getElementById('input').value.trim();
   if(!v){ toast('请输入 UCID 或频道链接', false); return; }
-  try {
-    const r = await fetch('/api/yt/channels', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ input: v })
-    });
-    const d = await r.json().catch(() => null);
-    document.getElementById('input').value = '';
-    if (r.ok && d && d.ok) {
-      toast('已添加：' + (d.title || d.id));
-    } else {
-      const msg = d && d.message ? d.message : ('添加失败 (HTTP ' + r.status + ')');
-      toast(msg, false);
-    }
-  } catch (e) {
-    toast('添加失败：' + (e && e.message ? e.message : '网络错误'), false);
+  const d = await api('/api/yt/channels', { method:'POST', body: JSON.stringify({ input: v }) });
+  document.getElementById('input').value = '';
+  if (d && d.ok) {
+    toast('已添加：' + (d.title || d.id));
+  } else {
+    toast((d && d.message) ? d.message : '添加失败', false);
   }
   load();
 }
-
 
 async function delch(id){
   if(!confirm('确定删除 '+id+' ?')) return;
@@ -3449,6 +3439,19 @@ async function test(id){
   const d = await api('/api/yt/test?channel_id='+encodeURIComponent(id));
   toast('检测完成：'+(d.pushedCount||0)+' 条');
   load();
+}
+// 新增：测试最新一期推送
+async function testLatest(id){
+  try{
+    const d = await api('/api/yt/test-latest?channel_id='+encodeURIComponent(id));
+    if (d && d.ok) {
+      toast('已发送最新一期：'+(d.videoTitle || '成功'));
+    } else {
+      toast('发送失败：'+(d && d.message ? d.message : '未知错误'), false);
+    }
+  }catch(e){
+    toast('发送失败：'+(e && e.message ? e.message : '网络错误'), false);
+  }
 }
 async function logs(){
   const d = await api('/api/yt/logs');
@@ -4866,15 +4869,23 @@ const api = {
             });
         }
         // 单频道测试
-        if (path === '/yt/test' && method === 'GET') {
-            const id = url.searchParams.get('channel_id');
-            const one = await ytProcessChannel(env, id);
-            return new Response(JSON.stringify(one), {
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            });
-        }
+		if (path === '/yt/test' && method === 'GET') {
+			const id = url.searchParams.get('channel_id');
+			const one = await ytProcessChannel(env, id);
+			return new Response(JSON.stringify(one), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		// 新增：单频道“测试最新一期”强制推送（不影响 last 记录）
+		if (path === '/yt/test-latest' && method === 'GET') {
+			const id = url.searchParams.get('channel_id');
+			const res = await ytSendLatest(env, id);
+			return new Response(JSON.stringify(res), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
         // 日志
         if (path === '/yt/logs' && method === 'GET') {
             return new Response(JSON.stringify(await ytGetLogs(env)), {
@@ -6016,6 +6027,55 @@ async function ytCheckAll(env) {
         results
     };
 }
+
+// 新增：强制发送最新一期内容（不更新 last，纯测试/即时发送）
+async function ytSendLatest(env, channelId) {
+    if (!channelId) return { ok: false, message: 'no_id' };
+
+    const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+    let resp;
+    try {
+        resp = await fetch(rssUrl, { headers: { 'user-agent': 'Mozilla/5.0 (Workers; YT RSS)' } });
+    } catch (e) {
+        await ytLog(env, `fetch error latest ${channelId} ${e}`);
+        return { ok: false, message: 'fetch_error' };
+    }
+    if (!resp.ok) {
+        await ytLog(env, `fetch fail latest ${channelId} http=${resp.status}`);
+        return { ok: false, message: 'fetch_fail', http: resp.status };
+    }
+
+    const xml = await resp.text();
+    const feed = ytParseRSS(xml);
+    if (!feed.entries.length) return { ok: false, message: 'no_entries' };
+
+    const e = feed.entries[0];
+
+    const config = await getConfig(env);
+    const timezone = config?.TIMEZONE || 'UTC';
+    const pub = e.published ? formatTimeInTimezone(new Date(e.published), timezone, 'datetime') : '';
+
+    const title = `YouTube 测试推送：${feed.title || channelId}`;
+    const content = `频道：${feed.title || channelId}
+标题：${e.title}
+链接：${e.link}
+发布时间：${pub}
+当前时区：${formatTimezoneDisplay(timezone)}`;
+
+    await sendNotificationToAllChannels(title, content, config, '[YouTube Test]');
+    await ytLog(env, `test-latest ${channelId} ${e.id} ${e.title}`);
+
+    return {
+        ok: true,
+        channelId,
+        channelTitle: feed.title,
+        videoId: e.id,
+        videoTitle: e.title,
+        link: e.link,
+        published: pub
+    };
+}
+
 
 async function sendTelegramNotification(message, config) {
     try {
