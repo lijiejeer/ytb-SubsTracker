@@ -1,4 +1,4 @@
-# ytb-SubsTracker
+# ytb-SubsTracker (参考wangwangit/SubsTracker修改)
 
 # 一、功能总览与关键点
 系统包含三大模块：
