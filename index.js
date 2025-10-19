@@ -76,40 +76,65 @@ function ytPickChannelId(input) {
 }
 
 async function ytResolveChannelId(url) {
-    // 允许 youtu.be 与 youtube.com 的各种路径
     let target = url;
     try {
-        // 简单归一化：如果是 youtu.be 短链，直接请求它，HTML 里同样包含 channelId
         const resp = await fetch(target, {
             headers: {
                 'user-agent': 'Mozilla/5.0 (Workers; YT RSS Resolver)',
                 'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8'
             },
-            cf: {
-                cacheEverything: false
-            }
+            cf: { cacheEverything: false }
         });
-        if (!resp.ok)
-            return '';
+        if (!resp.ok) return '';
         const html = await resp.text();
-        return ytExtractChannelIdFromHtml(html);
+        let id = ytExtractChannelIdFromHtml(html);
+        if (id) return id;
+
+        // 对 /@handle 增加 /about 兜底
+        try {
+            const u = new URL(target);
+            if (/^\/@[^/]+$/.test(u.pathname)) {
+                const resp2 = await fetch(u.origin + u.pathname + '/about', {
+                    headers: {
+                        'user-agent': 'Mozilla/5.0 (Workers; YT RSS Resolver)',
+                        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8'
+                    },
+                    cf: { cacheEverything: false }
+                });
+                if (resp2.ok) {
+                    const html2 = await resp2.text();
+                    id = ytExtractChannelIdFromHtml(html2);
+                    if (id) return id;
+                }
+            }
+        } catch (_) {}
+
+        return '';
     } catch {
         return '';
     }
 }
 
+
 function ytExtractChannelIdFromHtml(html) {
-    // 1) 最常见："channelId":"UCxxxx"
+    // 1) "channelId":"UCxxxx"
     let m = html.match(/"channelId":"(UC[0-9A-Za-z_-]+)"/);
-    if (m)
-        return m[1];
+    if (m) return m[1];
     // 2) data-channel-external-id="UCxxxx"
     m = html.match(/data-channel-external-id="(UC[0-9A-Za-z_-]+)"/);
-    if (m)
-        return m[1];
-    // 3) 兜底：ytInitialData/ytcfg 中也可能出现同样字段，已被 1) 覆盖
+    if (m) return m[1];
+    // 3) "externalId":"UCxxxx"
+    m = html.match(/"externalId":"(UC[0-9A-Za-z_-]+)"/);
+    if (m) return m[1];
+    // 4) "browseId":"UCxxxx"
+    m = html.match(/"browseId":"(UC[0-9A-Za-z_-]+)"/);
+    if (m) return m[1];
+    // 5) "canonicalChannelId":"UCxxxx"
+    m = html.match(/"canonicalChannelId":"(UC[0-9A-Za-z_-]+)"/);
+    if (m) return m[1];
     return '';
 }
+
 
 // 解析 YouTube RSS（取最近若干条）
 function ytParseRSS(xml) {
@@ -3388,15 +3413,26 @@ async function load(){
 async function add(){
   const v = document.getElementById('input').value.trim();
   if(!v){ toast('请输入 UCID 或频道链接', false); return; }
-  const d = await api('/api/yt/channels', { method:'POST', body: JSON.stringify({ input: v }) });
-  document.getElementById('input').value = '';
-  if (d && d.ok) {
-    toast('已添加：' + (d.title || d.id));
-  } else {
-    toast((d && d.message) ? d.message : '添加失败', false);
+  try {
+    const r = await fetch('/api/yt/channels', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ input: v })
+    });
+    const d = await r.json().catch(() => null);
+    document.getElementById('input').value = '';
+    if (r.ok && d && d.ok) {
+      toast('已添加：' + (d.title || d.id));
+    } else {
+      const msg = d && d.message ? d.message : ('添加失败 (HTTP ' + r.status + ')');
+      toast(msg, false);
+    }
+  } catch (e) {
+    toast('添加失败：' + (e && e.message ? e.message : '网络错误'), false);
   }
   load();
 }
+
 
 async function delch(id){
   if(!confirm('确定删除 '+id+' ?')) return;
